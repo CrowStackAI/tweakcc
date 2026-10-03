@@ -7,7 +7,17 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
   extractClaudeJsModulesFromNativeInstallation as extract,
   repackNativeInstallationModules as repack,
+  type ExtractedBunModule,
 } from './nativeInstallation';
+import { writeVerbosePropertyModules } from './patches/verboseProperty';
+
+/** Decode a module's source bytes per Bun's string encoding (see index.ts). */
+const decode = (module: ExtractedBunModule): string =>
+  module.encoding === 2
+    ? module.contents.toString('utf16le')
+    : module.encoding === 1
+      ? module.contents.toString('latin1')
+      : module.contents.toString('utf8');
 
 const hasBun = spawnSync('bun', ['--version'], { timeout: 5000 }).status === 0;
 
@@ -105,6 +115,87 @@ describe.skipIf(!hasBun)('compiled multi-module native round trip', () => {
     expect(patchedRun.status, patchedRun.stderr).toBe(0);
     expect(patchedRun.stdout.trim()).toBe('🦆 café');
   }, 30000);
+
+  it('applies a corpus feature patch (verbose) to the chunk that holds it, then round-trips and runs', () => {
+    // End-to-end proof of the module-corpus seam on a real compiled multi-module
+    // binary: the spinner element lives in a non-entry chunk (as it does in
+    // Claude Code), writeVerbosePropertyModules finds it across the corpus, and
+    // only that chunk is repacked. The entry stub is never the target.
+    const spinner =
+      'Q.jsx(HJa,{mode:e,responseLengthRef:o,spinnerSuffix:d,verbose:p,columns:f,thinkingStatus:m,isCompacting:h})';
+    fs.writeFileSync(
+      path.join(directory, 'ventry.js'),
+      'console.log((await import("./vpart.js")).value);'
+    );
+    fs.writeFileSync(
+      path.join(directory, 'vpart.js'),
+      `export const value = ${JSON.stringify(spinner)};`
+    );
+    const vinput = path.join(
+      directory,
+      process.platform === 'win32' ? 'vorig.exe' : 'vorig'
+    );
+    const build = spawnSync(
+      'bun',
+      [
+        'build',
+        '--compile',
+        '--splitting',
+        '--bytecode',
+        '--format=esm',
+        '--no-compile-autoload-dotenv',
+        '--no-compile-autoload-bunfig',
+        '--outfile',
+        vinput,
+        path.join(directory, 'ventry.js'),
+      ],
+      { encoding: 'utf8', timeout: 30000 }
+    );
+    expect(build.status, build.stderr).toBe(0);
+
+    const before = extract(vinput)!;
+    const jsModules = before.modules.filter(m => m.isJavaScript);
+    const sources = jsModules.map(decode);
+    const patched = writeVerbosePropertyModules(sources);
+    expect(patched).not.toBeNull();
+
+    // Exactly one module changed, and it is not the entry stub.
+    const changed = jsModules.filter((_, i) => patched![i] !== sources[i]);
+    expect(changed).toHaveLength(1);
+    expect(changed[0].isEntrypoint).toBe(false);
+    expect(patched![jsModules.indexOf(changed[0])]).toContain('verbose:true');
+
+    const output = path.join(
+      directory,
+      process.platform === 'win32' ? 'vpatched.exe' : 'vpatched'
+    );
+    repack(
+      vinput,
+      {
+        sourceSha256: before.sourceSha256,
+        modules: changed.map(m => ({
+          index: m.index,
+          name: m.name,
+          contents: Buffer.from(patched![jsModules.indexOf(m)], 'utf8'),
+        })),
+      },
+      output
+    );
+
+    const originalRun = spawnSync(vinput, [], {
+      encoding: 'utf8',
+      timeout: 10000,
+    });
+    const patchedRun = spawnSync(output, [], {
+      encoding: 'utf8',
+      timeout: 10000,
+    });
+    expect(originalRun.status, originalRun.stderr).toBe(0);
+    expect(originalRun.stdout).toContain('verbose:p');
+    expect(patchedRun.status, patchedRun.stderr).toBe(0);
+    expect(patchedRun.stdout).toContain('verbose:true');
+    expect(patchedRun.stdout).not.toContain('verbose:p');
+  }, 40000);
 
   it.skipIf(process.platform !== 'linux')(
     'uses the verified ELF snapshot if the input changes after the last check',

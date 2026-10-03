@@ -57,6 +57,23 @@ export {
 export { readContent, writeContent } from './content';
 
 // ============================================================================
+// Native Installation Extraction (bytecode-aware, module-level)
+// ============================================================================
+
+// `readContent` returns only the entrypoint module's source, which for a Bun
+// *bytecode* install (CC >= ~2.1.271) is just the ~23 KB plaintext wrapper — not
+// the real JS. The module-level extractor below walks the whole Bun module table
+// and decodes each module's bytes per its `encoding`, so it recovers the full
+// corpus from a bytecode binary. Exposed so downstream tools (e.g. a build-time
+// "did the mods land?" verifier) can grep the real corpus rather than the stub.
+export {
+  extractClaudeJsModulesFromNativeInstallation,
+  extractClaudeJsFromNativeInstallation,
+  type ExtractedBunModule,
+  type ExtractedBunCorpus,
+} from '../nativeInstallation';
+
+// ============================================================================
 // Backup & Restore
 // ============================================================================
 

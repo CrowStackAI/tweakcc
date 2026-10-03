@@ -1,6 +1,6 @@
 // Please see the note about writing patches in ./index
 
-import { LocationResult, showDiff } from './index';
+import { CorpusPatcher, LocationResult, liftToCorpus, showDiff } from './index';
 
 const getVerbosePropertyLocation = (oldFile: string): LocationResult | null => {
   // CC >=2.1.x compiles the UI with the React JSX automatic runtime, so the
@@ -56,3 +56,17 @@ export const writeVerboseProperty = (oldFile: string): string | null => {
   showDiff(oldFile, newFile, newCode, location.startIndex, location.endIndex);
   return newFile;
 };
+
+/**
+ * Corpus variant: runs the single-source locator across every native module and
+ * forces `verbose:true` wherever the spinner element lives, instead of only the
+ * ~22 KB entry stub. Modern Claude Code is a multi-chunk Bun bytecode bundle, so
+ * the spinner element is emitted in a chunk, not the entrypoint. Fail-loud: if
+ * the anchor is absent from every module the whole patch returns null (see
+ * `liftToCorpus`).
+ */
+// Defer the `liftToCorpus` call to invocation time: this module and ./index
+// import each other, so calling it at module-eval time would hit the helper
+// before ./index has finished initializing it.
+export const writeVerbosePropertyModules: CorpusPatcher = sources =>
+  liftToCorpus(writeVerboseProperty)(sources);

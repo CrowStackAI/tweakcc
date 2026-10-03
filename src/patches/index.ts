@@ -49,9 +49,15 @@ import {
   writeThinkerSymbolWidthLocation,
 } from './thinkerSymbolWidth';
 import { writeThinkingVerbs } from './thinkingVerbs';
-import { writeUserMessageDisplay } from './userMessageDisplay';
+import {
+  writeUserMessageDisplay,
+  writeUserMessageDisplayModules,
+} from './userMessageDisplay';
 import { writeInputPatternHighlighters } from './inputPatternHighlighters';
-import { writeVerboseProperty } from './verboseProperty';
+import {
+  writeVerboseProperty,
+  writeVerbosePropertyModules,
+} from './verboseProperty';
 import { writeModelCustomizations } from './modelSelector';
 import { writeOpusplan1m } from './opusplan1m';
 import { writeThinkingVisibility } from './thinkingVisibility';
@@ -144,6 +150,69 @@ export interface ModificationEdit {
   endIndex: number;
   newContent: string;
 }
+
+// =============================================================================
+// Module-corpus patching (the keystone generalization)
+// =============================================================================
+//
+// Legacy feature patchers are `(content: string) => string | null` fed only the
+// entry stub. Modern Claude Code is a multi-chunk Bun bytecode bundle whose
+// entry is a ~22 KB import stub, so a feature's target lives in some other
+// module. A corpus patcher instead runs across EVERY module source and returns
+// a new source array (or null), exactly like `applySystemPromptsToSources` and
+// `writePreventUnsupportedUpdatesModules` already do.
+
+/**
+ * Locates its target across all native module sources and returns a new sources
+ * array (changed modules differ), or null when the anchor is absent from every
+ * module. Array order and length are preserved; sources stay independent (a
+ * capture in one module's scope is never spliced into another).
+ */
+export type CorpusPatcher = (sources: readonly string[]) => string[] | null;
+
+/**
+ * Lifts a single-source patcher into a corpus patcher — the same relationship
+ * `applySystemPrompts` has to `applySystemPromptsToSources`: identical
+ * locate+edit logic, applied to independent module scopes instead of one
+ * bundle. A module whose anchor is absent returns null and is skipped; if EVERY
+ * module returns null the whole patch returns null (fail-loud — the anchor is
+ * nowhere in the corpus), never a silent no-op.
+ *
+ * The wrapped patcher MUST signal "anchor absent" with null, not an unchanged
+ * copy of its input; otherwise a non-matching chunk would mask a genuine
+ * corpus-wide miss. Per-module "not found" logging from the wrapped patcher is
+ * suppressed because absence from a given chunk is the expected case across
+ * ~1,900 modules; the caller surfaces the single real signal when the result is
+ * null. Both console.log and console.error are silenced during the sweep: the
+ * single-source helpers report "not found" through a mix of the two.
+ */
+export const liftToCorpus =
+  (fn: (content: string) => string | null): CorpusPatcher =>
+  sources => {
+    const result = [...sources];
+    let present = false;
+    let changed = false;
+    const originalLog = console.log;
+    const originalError = console.error;
+    console.log = () => {};
+    console.error = () => {};
+    try {
+      for (let i = 0; i < sources.length; i++) {
+        const patched = fn(sources[i]);
+        if (patched === null) continue;
+        present = true;
+        if (patched !== sources[i]) {
+          result[i] = patched;
+          changed = true;
+        }
+      }
+    } finally {
+      console.log = originalLog;
+      console.error = originalError;
+    }
+    if (!present) return null;
+    return changed ? result : [...sources];
+  };
 
 // =============================================================================
 // Patch Group and Result Types
@@ -560,12 +629,17 @@ export const escapeIdent = (ident: string): string => {
 const applyPatchImplementations = (
   content: string,
   implementations: Record<PatchId, PatchImplementation>,
-  patchFilter?: string[] | null
+  patchFilter?: string[] | null,
+  skipIds?: ReadonlySet<string>
 ): { content: string; results: PatchResult[] } => {
   const results: PatchResult[] = [];
 
   // Process patches in the order defined in PATCH_DEFINITIONS
   for (const def of PATCH_DEFINITIONS) {
+    // Patches already handled by the module-corpus phase are omitted entirely
+    // here (their result is recorded there); never double-run them on the stub.
+    if (skipIds?.has(def.id)) continue;
+
     const impl = implementations[def.id];
 
     // Skip patches not in the filter (if filter is provided)
@@ -614,6 +688,64 @@ const applyPatchImplementations = (
   }
 
   return { content, results };
+};
+
+/** A corpus patcher plus its optional enable condition (mirrors PatchImplementation). */
+interface CorpusPatchImplementation {
+  fn: CorpusPatcher;
+  condition?: boolean;
+}
+
+/**
+ * Runs corpus patchers across the full native module source array, threading the
+ * (possibly already prompt-patched) sources through each patcher in
+ * PATCH_DEFINITIONS order and tracking per-patch results. This is the
+ * module-corpus analogue of `applyPatchImplementations`: the single `content`
+ * stub is replaced by the whole `sources` array, and a patcher stages its edits
+ * into that array instead of into one string. A null result is a fail-loud miss
+ * (anchor absent from every module) and is surfaced, not swallowed.
+ */
+const applyCorpusPatchImplementations = (
+  sources: string[],
+  implementations: Partial<Record<PatchId, CorpusPatchImplementation>>,
+  patchFilter?: string[] | null
+): { sources: string[]; results: PatchResult[] } => {
+  const results: PatchResult[] = [];
+  let current = sources;
+
+  for (const def of PATCH_DEFINITIONS) {
+    const impl = implementations[def.id];
+    if (!impl) continue;
+
+    const base = {
+      id: def.id,
+      name: def.name,
+      group: def.group,
+      description: def.description,
+    };
+
+    if (patchFilter && !patchFilter.includes(def.id)) {
+      results.push({ ...base, applied: false, skipped: true });
+      continue;
+    }
+    if (impl.condition === false) {
+      results.push({ ...base, applied: false, skipped: true });
+      continue;
+    }
+
+    debug(`Applying corpus patch: ${def.name}`);
+    const next = impl.fn(current);
+    if (next === null) {
+      console.error(`patch: ${def.id}: anchor not found in any native module`);
+      results.push({ ...base, applied: false, failed: true });
+      continue;
+    }
+    const applied = next.some((source, index) => source !== current[index]);
+    current = next;
+    results.push({ ...base, applied, failed: false });
+  }
+
+  return { sources: current, results };
 };
 
 // =============================================================================
@@ -752,6 +884,52 @@ export const applyCustomization = async (
     (a, b) => a.name.localeCompare(b.name)
   );
   allResults.push(...sortedSystemPromptResults);
+
+  // ==========================================================================
+  // Apply feature patches converted to the module-corpus model
+  // ==========================================================================
+  // These run across every JS module and stage their edits into the shared
+  // nativePromptSources set — the same generalization the system prompts use,
+  // now for feature locators instead of only the entry stub. They are skipped
+  // from the entry-only generic phase below so they never double-run. npm
+  // installs (no corpus) keep driving these through their single-source `fn` in
+  // the generic phase, exactly as before.
+  const corpusFeatureSkip = new Set<string>();
+  const corpusFeatureResults: PatchResult[] = [];
+  if (nativeModules) {
+    const jsModules = nativeModules.filter(module => module.isJavaScript);
+    const featureSources = jsModules.map(
+      module => nativePromptSources.get(module.index)!
+    );
+    const corpusFeatureImplementations: Partial<
+      Record<PatchId, CorpusPatchImplementation>
+    > = {
+      'verbose-property': { fn: writeVerbosePropertyModules },
+      'user-message-display': {
+        fn: sources =>
+          writeUserMessageDisplayModules(
+            sources,
+            config.settings.userMessageDisplay!
+          ),
+        condition: !!config.settings.userMessageDisplay,
+      },
+    };
+    for (const id of Object.keys(corpusFeatureImplementations))
+      corpusFeatureSkip.add(id);
+
+    const featureResult = applyCorpusPatchImplementations(
+      featureSources,
+      corpusFeatureImplementations,
+      patchFilter
+    );
+    jsModules.forEach((module, index) =>
+      nativePromptSources.set(module.index, featureResult.sources[index])
+    );
+    corpusFeatureResults.push(...featureResult.results);
+
+    // Continue the entry-only generic phase from the post-feature entry source.
+    if (nativeEntry) content = nativePromptSources.get(nativeEntry.index)!;
+  }
 
   // Legacy items array for patchesAppliedIndication (backward compatibility)
   // Escape ANSI codes so they render properly when injected into cli.js
@@ -1101,7 +1279,12 @@ export const applyCustomization = async (
   // Apply all patches
   // ==========================================================================
   const { content: patchedContent, results: patchResults } =
-    applyPatchImplementations(content, patchImplementations, patchFilter);
+    applyPatchImplementations(
+      content,
+      patchImplementations,
+      patchFilter,
+      corpusFeatureSkip
+    );
   content = patchedContent;
   if (nativeGuardEdits.length) {
     // Chunk-only edits do not change the entrypoint string used by the generic
@@ -1112,6 +1295,7 @@ export const applyCustomization = async (
     if (guardResult) guardResult.applied = true;
   }
   allResults.push(...patchResults);
+  allResults.push(...corpusFeatureResults);
 
   // Compose prompt and guard changes by module identity. The guard was applied
   // to prompt-patched sources, so its final text supersedes that module only.

@@ -3,6 +3,7 @@ import {
   findBoxComponent,
   findChalkVar,
   findTextComponent,
+  liftToCorpus,
   showDiff,
 } from './index';
 import { UserMessageDisplayConfig } from '../types';
@@ -162,10 +163,15 @@ export const writeUserMessageDisplay = (
   const match = oldMatch ?? newMatch ?? memoizedChildMatch;
 
   if (!match || match.index === undefined) {
+    // Fail loud with a null "anchor absent" signal rather than silently
+    // returning the input unchanged. The corpus runner relies on null to tell a
+    // non-matching chunk apart from a genuine corpus-wide miss; returning
+    // oldFile here would let any chunk mask a real failure to locate the
+    // display site (and a null is the honest signal on the npm path too).
     console.error(
       'patch: userMessageDisplay: failed to find user message display pattern'
     );
-    return oldFile;
+    return null;
   }
 
   let createElementFn: string;
@@ -300,3 +306,21 @@ export const writeUserMessageDisplay = (
 
   return newFile;
 };
+
+/**
+ * Corpus variant: runs the single-source patcher across every native module.
+ *
+ * This is the hard case for the module-corpus model. The single-source patcher
+ * must resolve the Text/Box/chalk/React identifiers it injects AND find the
+ * user-message display site; in a split Bun bytecode bundle those live in
+ * separate ESM chunks, so a chunk that contains the "No content found…" anchor
+ * typically does NOT define the component identifiers it needs. When the
+ * patcher cannot resolve them it returns null, and the fail-loud `liftToCorpus`
+ * contract turns a corpus with no fully-resolvable site into a null result
+ * (surfaced as a failed patch) rather than injecting a dangling identifier.
+ */
+export const writeUserMessageDisplayModules = (
+  sources: readonly string[],
+  config: UserMessageDisplayConfig
+): string[] | null =>
+  liftToCorpus(content => writeUserMessageDisplay(content, config))(sources);

@@ -1479,11 +1479,66 @@ function repackPE(
   }
 }
 
-/**
- * Alignment constant used by BUN_COMPILED in c-bindings.cpp.
- * The BUN_COMPILED symbol is placed with __attribute__((aligned(BLOB_HEADER_ALIGNMENT))).
- */
-const BLOB_HEADER_ALIGNMENT = 16384;
+export function findUniqueBufferPointer(
+  buffers: ReadonlyArray<{ content: Buffer; virtualAddress: bigint }>,
+  pointer: bigint
+): bigint {
+  const needle = Buffer.alloc(8);
+  needle.writeBigUInt64LE(pointer);
+  const matches: bigint[] = [];
+
+  // Collect every match (no early break) so the alignment filter and nearest
+  // pick below see all candidates, and any error lists them for diagnosis.
+  for (const buffer of buffers) {
+    let offset = -1;
+    while ((offset = buffer.content.indexOf(needle, offset + 1)) !== -1) {
+      matches.push(buffer.virtualAddress + BigInt(offset));
+    }
+  }
+
+  if (matches.length === 0) {
+    throw new Error(
+      `Could not find BUN_COMPILED pointer to 0x${pointer.toString(16)}`
+    );
+  }
+  if (matches.length === 1) {
+    return matches[0];
+  }
+
+  // Multiple byte-matches. A BUN_COMPILED pointer slot is 8-aligned, so drop
+  // coincidental unaligned hits (data that happens to carry the same 8-byte LE
+  // value at an offset ≡ non-zero mod 8). On CC 2.1.288 arm64 the 5 raw matches
+  // collapse to 2 aligned candidates.
+  const aligned = matches.filter(m => (m & 7n) === 0n);
+  if (aligned.length === 0) {
+    throw new Error(
+      `Found multiple BUN_COMPILED pointers to 0x${pointer.toString(16)} at [${matches
+        .map(m => `0x${m.toString(16)}`)
+        .join(', ')}] but none are 8-aligned`
+    );
+  }
+  if (aligned.length === 1) {
+    return aligned[0];
+  }
+
+  // Still ambiguous: pick the aligned slot nearest the referenced section vaddr
+  // (tie-break: lowest address). We do NOT throw — the build-modded-cc.sh boot
+  // smoke-test is the real guard that the chosen slot yields a runnable binary.
+  const dist = (m: bigint): bigint => (m > pointer ? m - pointer : pointer - m);
+  const chosen = aligned.reduce((best, m) => {
+    const d = dist(m);
+    const bd = dist(best);
+    if (d < bd) return m;
+    if (d === bd && m < best) return m;
+    return best;
+  });
+  console.warn(
+    `findUniqueBufferPointer: multiple 8-aligned BUN_COMPILED pointers to 0x${pointer.toString(16)} at [${aligned
+      .map(m => `0x${m.toString(16)}`)
+      .join(', ')}]; chose nearest 0x${chosen.toString(16)}`
+  );
+  return chosen;
+}
 
 function alignBigInt(value: bigint, alignment: bigint): bigint {
   return ((value + alignment - 1n) / alignment) * alignment;
@@ -1815,35 +1870,26 @@ function repackELFSection(
       'repackELFSection: .bun is not a replaceable tail allocation; falling back to relocation'
     );
     const oldBunSectionVaddr = bunSection.virtualAddress;
-    const vaddrBytes = Buffer.alloc(8);
-    vaddrBytes.writeBigUInt64LE(oldBunSectionVaddr);
 
-    let bunCompiledVaddr: bigint | null = null;
-    const rwContent = rwSegment.content;
-    const rwVaddrStart = rwSegment.virtualAddress;
-    const firstAligned = alignBigInt(
-      rwVaddrStart,
-      BigInt(BLOB_HEADER_ALIGNMENT)
+    // Locate the BUN_COMPILED back-pointer by scanning the single writable
+    // PT_LOAD that owns `.bun` (`rwSegment`) for the 8-byte little-endian
+    // vaddr, alignment-agnostic. The byte-by-byte walk fixes the original bug
+    // (a fixed-stride scan keyed off page alignment steps over the 8-aligned
+    // anchor — on arm64 the relocation path is always taken and the strided
+    // scan missed it). Scope is deliberately limited to rwSegment, NOT all
+    // writable LOAD segments: the back-pointer lives in the .bun-owning
+    // PT_LOAD, and scanning every writable segment admits coincidental 8-byte
+    // collisions of the same vaddr value elsewhere — observed on CC 2.1.288
+    // arm64, where an all-segments scan found multiple matches for 0x56a0000.
+    const bunCompiledVaddr = findUniqueBufferPointer(
+      [
+        {
+          content: rwSegment.content,
+          virtualAddress: rwSegment.virtualAddress,
+        },
+      ],
+      oldBunSectionVaddr
     );
-    const lastCandidate = rwVaddrStart + BigInt(rwContent.length) - 8n;
-
-    for (
-      let va = firstAligned;
-      va <= lastCandidate;
-      va += BigInt(BLOB_HEADER_ALIGNMENT)
-    ) {
-      const off = Number(va - rwVaddrStart);
-      if (rwContent.subarray(off, off + 8).equals(vaddrBytes)) {
-        bunCompiledVaddr = va;
-        break;
-      }
-    }
-
-    if (bunCompiledVaddr === null) {
-      throw new Error(
-        `Could not find original BUN_COMPILED location in binary (searched for 0x${oldBunSectionVaddr.toString(16)})`
-      );
-    }
 
     const pageSize = elfBinary.pageSize();
     const newContentSize = BigInt(newSectionData.length);
